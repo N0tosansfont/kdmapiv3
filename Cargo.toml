@@ -1,0 +1,49 @@
+[workspace]
+members = [".", "crates/kdmapiv3-config"]
+default-members = ["."]
+resolver = "2"
+
+[package]
+name = "kdmapiv3"
+version = "3.0.0-alpha.1"
+edition = "2021"
+description = "Drop-in, ultra-low-latency Rust KDMAPI (OmniMIDI) replacement for high-density Black MIDI playback"
+license = "MIT"
+
+[lib]
+name = "OmniMIDI"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Core OmniMIDI crate stays 100% GUI-free.
+# Cold-path config & SoundFont loaders (never called on SendDirectData or audio render hot paths):
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+soundfont = "0.1"
+xsynth-soundfonts = "0.3.4"
+symphonia = { version = "0.5", default-features = false, features = [
+    "pcm",
+    "wav",
+    "flac",
+    "ogg",
+    "vorbis",
+    "adpcm",
+] }
+# Cross-platform low-latency audio output (ALSA/PipeWire on Linux, WASAPI on Windows).
+cpal = "0.15"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

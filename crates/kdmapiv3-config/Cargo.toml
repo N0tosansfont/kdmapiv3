@@ -1,0 +1,30 @@
+[package]
+name = "kdmapiv3-config"
+version = "3.0.0-alpha.1"
+edition = "2021"
+description = "Standalone cross-platform GUI configurator for kdmapiv3.toml"
+license = "MIT"
+
+[[bin]]
+name = "kdmapiv3-config"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "x11",
+    "wayland",
+] }
+egui = "0.31"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+rfd = "0.15"
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+] }

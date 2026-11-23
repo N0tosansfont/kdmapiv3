@@ -1,0 +1,23 @@
+{
+    global:
+        ReturnKDMAPIVer;
+        IsKDMAPIAvailable;
+        InitializeKDMAPIStream;
+        TerminateKDMAPIStream;
+        ResetKDMAPIStream;
+        InitializeCallbackFeatures;
+        RunCallbackFunction;
+        SendDirectData;
+        SendDirectDataNoBuf;
+        SendDirectLongData;
+        SendDirectLongDataNoBuf;
+        PrepareLongData;
+        UnprepareLongData;
+        SendCustomEvent;
+        DriverSettings;
+        LoadCustomSoundFontsList;
+        GetRenderingTime;
+        GetVoiceCount;
+    local:
+        *;
+};

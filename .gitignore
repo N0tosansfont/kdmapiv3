@@ -1,0 +1,7 @@
+/target
+/dist
+Cargo.lock
+kdmapiv3.log
+*.pdb
+*.exp
+*.lib
