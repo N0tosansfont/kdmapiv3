@@ -83,9 +83,9 @@ disable_all_effects = false
 ## Note from the Author
 
 Hi! I'm just an ordinary person living in a small city in South Korea.  
-I deeply love and respect everyone in the Black MIDI community—original developers, MIDI creators, and players alike—and I hold no ill will toward anyone. This project was put together out of pure passion for exploring real-time playback limits, working right from the CLI :)
+I deeply love and respect everyone in the Black MIDI community—original developers, MIDI creators, and players alike—and I hold no ill will toward anyone. This project was crafted via CLI with AI assistance out of pure passion for exploring real-time playback limits :)
 
 ---
 
 안녕하세요! 대한민국에 살고 있는 한 소도시 사람입니다.  
-검은악보(Black MIDI) 관련자분들 모두를 사랑하고 존경하며, 어떠한 악감정도 없습니다. 순수한 애정으로 CLI 환경에서 작업했습니다 :)
+검은악보(Black MIDI) 관련자분들 모두를 사랑하고 존경하며, 어떠한 악감정도 없습니다. 순수한 애정으로 AI의 도움을 받아 CLI 환경에서 작업했습니다 :)
