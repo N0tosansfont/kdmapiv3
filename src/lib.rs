@@ -11,11 +11,6 @@
 //! - [`telemetry`]: Optional, non-blocking low-priority background `kdmapiv3.log` writer.
 //! - [`ffi`]: Panic-safe, null-checked `#[no_mangle] pub extern "system"` KDMAPI C ABI.
 
-#[cfg(not(target_pointer_width = "64"))]
-compile_error!(
-    "we didn't build this for 32-bit, but if you're stubborn enough to compile it on x86 anyway, we won't stop you :) — kdmapiv3 requires a 64-bit target (target_pointer_width = \"64\")."
-);
-
 pub mod audio;
 pub mod backend;
 pub mod config;

@@ -482,6 +482,7 @@ fn render_audio_callback<T: cpal::FromSample<f32> + Sample>(
         return;
     };
 
+    crate::synth::enable_ftz_daz();
     let budget_secs = (total_frames.max(1) as f32) / (sample_rate.max(8_000) as f32);
     let max_drain_dur = Duration::from_secs_f32((budget_secs * MAX_DRAIN_BUDGET_FRACTION).max(0.0005));
 

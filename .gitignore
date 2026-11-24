@@ -1,7 +1,12 @@
 /target
-/dist
-Cargo.lock
-kdmapiv3.log
+*.bak*
+**/*.rs.bk
 *.pdb
-*.exp
-*.lib
+*.sf2
+*.sf3
+*.mid
+*.midi
+*.wav
+*.mp3
+*.mp4
+.DS_Store

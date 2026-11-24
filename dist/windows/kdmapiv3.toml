@@ -1,0 +1,39 @@
+# kdmapiv3 configuration file
+# Loaded once during InitializeKDMAPIStream (never touched on the audio/MIDI hot path).
+#
+# Placement priority:
+#   1. $KDMAPIV3_CONFIG (optional environment variable override)
+#   2. Next to libOmniMIDI.so / OmniMIDI.dll (portable drop-in next to Wasabi or PFA)
+#   3. Linux:   ~/.config/kdmapiv3/kdmapiv3.toml
+#      Windows: %APPDATA%\kdmapiv3\kdmapiv3.toml
+
+# Maximum simultaneous voices for Black MIDI playback (default: 10000).
+voice_limit = 10000
+
+# Resampling interpolation quality: "linear", "sinc8", "sinc16", or "sinc32" (default: "linear").
+interpolation = "linear"
+
+# Audio render buffer size in frames: 64, 128, 256, 512, 1024, 2048, 4096 (default: 512).
+buffer_frames = 512
+
+# Pre-allocated lock-free MIDI ring buffer slots (power of two; default: 1048576).
+ring_buffer_capacity = 1048576
+
+# Ordered list of SoundFont (.sf2 / .sfz) paths.
+# Windows backslashes, Wine Z:\ paths, and mismatched casing are normalized automatically.
+# Example:
+# soundfonts = [
+#     '/home/user/SoundFonts/KeppyGrand.sf2',
+#     'C:\SoundFonts\ExtraPercussion.sf2',
+# ]
+soundfonts = []
+
+# Optional non-blocking diagnostics: when true, a separate low-priority background thread
+# writes a 1-second atomic counter summary to kdmapiv3.log without touching the hot path.
+telemetry_enabled = false
+
+# Low-Spec / Black MIDI DSP Effect Toggles (zero hot-path overhead when disabled).
+[effects]
+enable_lowpass_filter = true
+enable_vibrato_lfo = true
+disable_all_effects = false

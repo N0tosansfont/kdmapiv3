@@ -318,14 +318,62 @@ struct PresetEntry {
     preset: u16,
     region_start: u32,
     region_count: u32,
+    key_bucket_base: u32,
 }
 
+#[derive(Clone, Copy)]
+struct RegionPrecomp {
+    delay_samples: u32,
+    attack_inc: f32,
+    base_hold_samples: u32,
+    base_decay_mul: f32,
+    release_mul: f32,
+    has_key_to_hold: bool,
+    has_key_to_decay: bool,
+    tune_sr_mul: f64,
+    filter_inv_2q: f32,
+}
+
+const FILTER_TRIG_LUT_STEPS: usize = 512;
+const FILTER_TRIG_LUT_LEN: usize = FILTER_TRIG_LUT_STEPS + 1;
+
+fn build_semitone_ratio_table() -> Box<[f64; 255]> {
+    let mut arr = Box::new([1.0f64; 255]);
+    for i in 0..255 {
+        arr[i] = 2.0f64.powf((i as i32 - 127) as f64 / 12.0);
+    }
+    arr
+}
+
+fn build_filter_trig_lut(sr: u32) -> Box<[(f32, f32); FILTER_TRIG_LUT_LEN]> {
+    let sr_f64 = sr.max(8_000) as f64;
+    let mut arr = Box::new([(1.0f32, 0.0f32); FILTER_TRIG_LUT_LEN]);
+    for i in 0..FILTER_TRIG_LUT_LEN {
+        let cents = 1_500.0 + (i as f64) * (12_000.0 / FILTER_TRIG_LUT_STEPS as f64);
+        let fc = (8.175_798_915_6 * 2.0f64.powf(cents / 1_200.0)).clamp(20.0, 0.45 * sr_f64);
+        let w0 = 2.0 * core::f64::consts::PI * fc / sr_f64;
+        arr[i] = (w0.cos() as f32, w0.sin() as f32);
+    }
+    arr
+}
+
+fn compute_filter_max_active_cents(sr: u32) -> f32 {
+    let sr_f64 = sr.max(8_000) as f64;
+    (1_200.0 * ((0.45 * sr_f64) / 8.175_798_915_6).log2()).min(13_499.0) as f32
+}
 
 /// Immutable, pre-loaded SoundFont bank ready for lock-free, allocation-free rendering.
 pub struct SoundFontBank {
     samples: Box<[SampleAsset]>,
     regions: Box<[SynthRegion]>,
     presets: Box<[PresetEntry]>,
+    key_region_ranges: Box<[(u32, u16)]>,
+    key_region_indices: Box<[u32]>,
+    region_precomp: Box<[RegionPrecomp]>,
+    semitone_ratios: Box<[f64; 255]>,
+    filter_trig_lut: Box<[(f32, f32); FILTER_TRIG_LUT_LEN]>,
+    filter_max_active_cents: f32,
+    precomp_sr: u32,
 }
 
 impl SoundFontBank {
@@ -334,6 +382,95 @@ impl SoundFontBank {
             samples: Box::new([]),
             regions: Box::new([]),
             presets: Box::new([]),
+            key_region_ranges: Box::new([]),
+            key_region_indices: Box::new([]),
+            region_precomp: Box::new([]),
+            semitone_ratios: build_semitone_ratio_table(),
+            filter_trig_lut: build_filter_trig_lut(48_000),
+            filter_max_active_cents: compute_filter_max_active_cents(48_000),
+            precomp_sr: 48_000,
+        }
+    }
+
+    fn from_parts(
+        samples: Box<[SampleAsset]>,
+        regions: Box<[SynthRegion]>,
+        mut presets: Box<[PresetEntry]>,
+        output_sample_rate: u32,
+    ) -> Self {
+        let mut key_region_ranges: Vec<(u32, u16)> = Vec::with_capacity(presets.len() * 128);
+        let mut key_region_indices: Vec<u32> = Vec::new();
+        for p in presets.iter_mut() {
+            let start = p.region_start as usize;
+            let end = start
+                .saturating_add(p.region_count as usize)
+                .min(regions.len());
+            p.key_bucket_base = key_region_ranges.len() as u32;
+            let mut per_key: [Vec<u32>; 128] = core::array::from_fn(|_| Vec::new());
+            for idx in start..end {
+                let r = &regions[idx];
+                let lo = (r.key_low as usize).min(127);
+                let hi = (r.key_high as usize).min(127);
+                if lo <= hi {
+                    for k in lo..=hi {
+                        per_key[k].push(idx as u32);
+                    }
+                }
+            }
+            for bucket in &per_key {
+                let b_start = key_region_indices.len() as u32;
+                let b_len = bucket.len().min(u16::MAX as usize) as u16;
+                key_region_indices.extend_from_slice(&bucket[..b_len as usize]);
+                key_region_ranges.push((b_start, b_len));
+            }
+        }
+
+        let precomp_sr = output_sample_rate.max(8_000);
+        let sr_f64 = precomp_sr as f64;
+        let sr_f32 = precomp_sr as f32;
+        let mut region_precomp = Vec::with_capacity(regions.len());
+        for r in regions.iter() {
+            let delay_samples = (timecents_to_secs(r.env_delay_tc) * sr_f32) as u32;
+            let attack_samples = (timecents_to_secs(r.env_attack_tc).max(0.001) * sr_f32).max(1.0);
+            let base_hold_samples = (timecents_to_secs(r.env_hold_tc) * sr_f32) as u32;
+            let base_decay_samples =
+                (timecents_to_secs(r.env_decay_tc).max(0.001) * sr_f32).max(1.0);
+            let release_samples =
+                (timecents_to_secs(r.env_release_tc).max(0.005) * sr_f32).max(16.0);
+            let sample_sr = samples
+                .get(r.sample_idx as usize)
+                .map(|a| a.sample_rate.max(1) as f64)
+                .unwrap_or(sr_f64);
+            let q_db = (r.filter_q_cb / 10.0).clamp(0.0, 96.0) as f64;
+            let q_lin = 10.0f64.powf(q_db / 20.0) * core::f64::consts::FRAC_1_SQRT_2;
+            region_precomp.push(RegionPrecomp {
+                delay_samples,
+                attack_inc: 1.0 / attack_samples,
+                base_hold_samples,
+                base_decay_mul: (LN_ENV_ATTEN / base_decay_samples)
+                    .exp()
+                    .clamp(0.5, 0.999_999),
+                release_mul: (LN_ENV_ATTEN / release_samples)
+                    .exp()
+                    .clamp(0.5, 0.999_999),
+                has_key_to_hold: r.key_to_hold_tc != 0.0,
+                has_key_to_decay: r.key_to_decay_tc != 0.0,
+                tune_sr_mul: 2.0f64.powf(r.tune_cents as f64 / 1200.0) * (sample_sr / sr_f64),
+                filter_inv_2q: (0.5 / q_lin) as f32,
+            });
+        }
+
+        Self {
+            samples,
+            regions,
+            presets,
+            key_region_ranges: key_region_ranges.into_boxed_slice(),
+            key_region_indices: key_region_indices.into_boxed_slice(),
+            region_precomp: region_precomp.into_boxed_slice(),
+            semitone_ratios: build_semitone_ratio_table(),
+            filter_trig_lut: build_filter_trig_lut(precomp_sr),
+            filter_max_active_cents: compute_filter_max_active_cents(precomp_sr),
+            precomp_sr,
         }
     }
 
@@ -394,15 +531,17 @@ impl SoundFontBank {
                     preset,
                     region_start: start,
                     region_count: count,
+                    key_bucket_base: 0,
                 });
             }
         }
 
-        Self {
-            samples: samples.into_boxed_slice(),
-            regions: regions.into_boxed_slice(),
-            presets: presets.into_boxed_slice(),
-        }
+        Self::from_parts(
+            samples.into_boxed_slice(),
+            regions.into_boxed_slice(),
+            presets.into_boxed_slice(),
+            output_sample_rate,
+        )
     }
 
     /// Allocation-free O(log P) preset lookup with standard GM fallbacks.
@@ -1201,6 +1340,21 @@ impl VoiceFilter {
     }
 
     #[inline(always)]
+    fn from_cos_sin_inv2q(cos_w0: f32, sin_w0: f32, inv_2q: f32) -> Self {
+        let alpha = sin_w0 * inv_2q;
+        let inv_a0 = 1.0 / (1.0 + alpha);
+        Self {
+            b0: ((1.0 - cos_w0) * 0.5) * inv_a0,
+            a1: (-2.0 * cos_w0) * inv_a0,
+            a2: (1.0 - alpha) * inv_a0,
+            l_z1: 0.0,
+            l_z2: 0.0,
+            r_z1: 0.0,
+            r_z2: 0.0,
+        }
+    }
+
+    #[inline(always)]
     fn step_left(&mut self, x: f32) -> f32 {
         let b0x = self.b0 * x;
         let y = b0x + self.l_z1;
@@ -1656,8 +1810,31 @@ impl Drop for RenderPool {
     }
 }
 
+#[inline(always)]
+pub(crate) fn enable_ftz_daz() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        const FTZ_DAZ_MASK: u32 = 0x8040;
+        let mut csr: u32 = 0;
+        core::arch::asm!(
+            "stmxcsr dword ptr [{}]",
+            in(reg) &mut csr as *mut u32,
+            options(nostack, preserves_flags),
+        );
+        if (csr & FTZ_DAZ_MASK) != FTZ_DAZ_MASK {
+            let new_csr = csr | FTZ_DAZ_MASK;
+            core::arch::asm!(
+                "ldmxcsr dword ptr [{}]",
+                in(reg) &new_csr as *const u32,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
 fn worker_loop(worker_id: usize, shared: Arc<SharedRenderState>) {
     let _ = crate::backend::platform::configure_realtime_thread();
+    enable_ftz_daz();
     shared.ready_workers.0.fetch_add(1, Ordering::Release);
 
     let mut last_epoch = 0u64;
@@ -2142,25 +2319,28 @@ impl SoundFontSynth {
         let preset = ch.program as u16;
         let sr = self.config.sample_rate.max(8_000) as f64;
 
-        let (region_start, region_count) = match self.bank.find_preset_entry(bank, preset) {
-            Some(entry) => (entry.region_start as usize, entry.region_count as usize),
+        let preset_entry = match self.bank.find_preset_entry(bank, preset) {
+            Some(entry) => entry,
             None => return,
         };
+        let bucket_idx = preset_entry.key_bucket_base as usize + ((key as usize) & 0x7F);
+        let (bucket_start, bucket_len) = match self.bank.key_region_ranges.get(bucket_idx) {
+            Some(&(st, ln)) if ln > 0 => (st as usize, ln as usize),
+            _ => return,
+        };
+        let use_precomp = self.config.sample_rate.max(8_000) == self.bank.precomp_sr;
 
         // Snapshot age before spawning multi-layer zones so exclusiveClass only chokes prior notes.
         let age_before_note = self.age_counter;
         let mut last_choked_class = 0u8;
 
-        for r_idx in 0..region_count {
-            let Some(&region) = self.bank.regions.get(region_start + r_idx) else {
+        for b_off in 0..bucket_len {
+            let region_idx = self.bank.key_region_indices[bucket_start + b_off] as usize;
+            let Some(&region) = self.bank.regions.get(region_idx) else {
                 break;
             };
 
-            if key < region.key_low
-                || key > region.key_high
-                || velocity < region.vel_low
-                || velocity > region.vel_high
-            {
+            if velocity < region.vel_low || velocity > region.vel_high {
                 continue;
             }
 
@@ -2206,60 +2386,119 @@ impl SoundFontSynth {
                 self.unlink_voice_key(slot);
             }
 
+            let pre = self.bank.region_precomp[region_idx];
+
             // Pitch calculation with SF2 `scaleTuning` (gen 56), `coarseTune`, `fineTune`, `overridingRootKey`.
-            let semitones = ((key as f64 - region.root_key as f64)
-                * (region.scale_tuning as f64 / 100.0))
-                + (region.tune_cents as f64 / 100.0);
-            let base_step = 2.0f64.powf(semitones / 12.0) * (sample_sr / sr);
+            let base_step = if use_precomp && region.scale_tuning == 100.0 {
+                let lut_idx = (key as i32 - region.root_key as i32 + 127).clamp(0, 254) as usize;
+                self.bank.semitone_ratios[lut_idx] * pre.tune_sr_mul
+            } else {
+                let semitones = ((key as f64 - region.root_key as f64)
+                    * (region.scale_tuning as f64 / 100.0))
+                    + (region.tune_cents as f64 / 100.0);
+                2.0f64.powf(semitones / 12.0) * (sample_sr / sr)
+            };
 
             // Constant-power stereo panning combining SF2 `pan` (gen 17) and MIDI CC10.
             let total_pan = (ch.pan + region.pan).clamp(-1.0, 1.0);
-            let angle = (total_pan + 1.0) * core::f32::consts::FRAC_PI_4;
+            let (sin_a, cos_a) = ((total_pan + 1.0) * core::f32::consts::FRAC_PI_4).sin_cos();
             let (gain_l, gain_r) = if sample_right_ptr.is_null() {
-                (combined_gain * angle.cos(), combined_gain * angle.sin())
+                (combined_gain * cos_a, combined_gain * sin_a)
             } else {
                 // Linked stereo pair: unity L/R at center without 3 dB mono collapse,
                 // constant-power balance when panned left or right.
-                let gl = (angle.cos() * core::f32::consts::SQRT_2).min(1.0);
-                let gr = (angle.sin() * core::f32::consts::SQRT_2).min(1.0);
+                let gl = (cos_a * core::f32::consts::SQRT_2).min(1.0);
+                let gr = (sin_a * core::f32::consts::SQRT_2).min(1.0);
                 (combined_gain * gl, combined_gain * gr)
             };
 
-            // Key-to-Envelope scaling (gens 39 & 40) + exponential-in-dB Decay & Release.
-            let key_delta = 60.0 - (key as f32);
-            let delay_secs = timecents_to_secs(region.env_delay_tc);
-            let attack_secs = timecents_to_secs(region.env_attack_tc).max(0.001);
-            let hold_secs = timecents_to_secs(region.env_hold_tc + key_delta * region.key_to_hold_tc);
-            let decay_secs =
-                timecents_to_secs(region.env_decay_tc + key_delta * region.key_to_decay_tc)
-                    .max(0.001);
-            let release_secs = timecents_to_secs(region.env_release_tc).max(0.005);
-
             let sr_f32 = sr as f32;
-            let delay_samples = (delay_secs * sr_f32) as u32;
-            let attack_samples = (attack_secs * sr_f32).max(1.0);
-            let hold_samples = (hold_secs * sr_f32) as u32;
-            let decay_samples = (decay_secs * sr_f32).max(1.0);
-            let release_samples = (release_secs * sr_f32).max(16.0);
-
-            // Exponential attenuation in dB (-100 dB / `1e-5` over decay_secs / release_secs).
-            let decay_mul = (LN_ENV_ATTEN / decay_samples).exp().clamp(0.5, 0.999_999);
-            let release_mul = (LN_ENV_ATTEN / release_samples)
-                .exp()
-                .clamp(0.5, 0.999_999);
+            let (delay_samples, attack_inc, hold_samples, decay_mul, release_mul) = if use_precomp {
+                let key_delta = 60.0 - (key as f32);
+                let hold_samples = if pre.has_key_to_hold {
+                    (timecents_to_secs(region.env_hold_tc + key_delta * region.key_to_hold_tc)
+                        * sr_f32) as u32
+                } else {
+                    pre.base_hold_samples
+                };
+                let decay_mul = if pre.has_key_to_decay {
+                    let decay_samples = (timecents_to_secs(
+                        region.env_decay_tc + key_delta * region.key_to_decay_tc,
+                    )
+                    .max(0.001)
+                        * sr_f32)
+                        .max(1.0);
+                    (LN_ENV_ATTEN / decay_samples).exp().clamp(0.5, 0.999_999)
+                } else {
+                    pre.base_decay_mul
+                };
+                (
+                    pre.delay_samples,
+                    pre.attack_inc,
+                    hold_samples,
+                    decay_mul,
+                    pre.release_mul,
+                )
+            } else {
+                let key_delta = 60.0 - (key as f32);
+                let delay_samples = (timecents_to_secs(region.env_delay_tc) * sr_f32) as u32;
+                let attack_samples =
+                    (timecents_to_secs(region.env_attack_tc).max(0.001) * sr_f32).max(1.0);
+                let hold_samples = (timecents_to_secs(
+                    region.env_hold_tc + key_delta * region.key_to_hold_tc,
+                ) * sr_f32) as u32;
+                let decay_samples = (timecents_to_secs(
+                    region.env_decay_tc + key_delta * region.key_to_decay_tc,
+                )
+                .max(0.001)
+                    * sr_f32)
+                    .max(1.0);
+                let release_samples =
+                    (timecents_to_secs(region.env_release_tc).max(0.005) * sr_f32).max(16.0);
+                (
+                    delay_samples,
+                    1.0 / attack_samples,
+                    hold_samples,
+                    (LN_ENV_ATTEN / decay_samples).exp().clamp(0.5, 0.999_999),
+                    (LN_ENV_ATTEN / release_samples).exp().clamp(0.5, 0.999_999),
+                )
+            };
 
             // Bypassable resonant 2-pole LPF + SF2 2.01 default Velocity-to-Filter modulator.
             // Completely skipped (0% Note-On and 0% render overhead) when disabled via config.
             let (filter_active, filter) = if self.enable_lowpass_filter {
                 let vel_fc_mod = region.vel_to_filter_cents * (1.0 - (velocity as f32) / 127.0);
                 let eff_fc_cents = (region.filter_fc_cents + vel_fc_mod).clamp(1_500.0, 13_500.0);
-                let fc_hz = 8.175_798_915_6 * 2.0f64.powf(eff_fc_cents as f64 / 1_200.0);
-                let active =
-                    (eff_fc_cents < 13_499.0 && fc_hz < 0.45 * sr) || region.filter_q_cb > 0.5;
-                if active {
-                    (true, VoiceFilter::from_fc_q(fc_hz, region.filter_q_cb, sr))
-                } else {
+                if use_precomp {
+                    let active = eff_fc_cents < self.bank.filter_max_active_cents
+                        || region.filter_q_cb > 0.5;
+                    if active {
+                        let t = (eff_fc_cents - 1_500.0)
+                            * (FILTER_TRIG_LUT_STEPS as f32 / 12_000.0);
+                        let idx = (t as usize).min(FILTER_TRIG_LUT_STEPS - 1);
+                        let frac = t - (idx as f32);
+                        let (c0, s0) = self.bank.filter_trig_lut[idx];
+                        let (c1, s1) = self.bank.filter_trig_lut[idx + 1];
+                        let cos_w0 = c0 + (c1 - c0) * frac;
+                        let sin_w0 = s0 + (s1 - s0) * frac;
+                        (
+                            true,
+                            VoiceFilter::from_cos_sin_inv2q(cos_w0, sin_w0, pre.filter_inv_2q),
+                        )
+                    } else {
+                        (false, VoiceFilter::default())
+                    }
+                } else if eff_fc_cents >= 13_499.0 && region.filter_q_cb <= 0.5 {
                     (false, VoiceFilter::default())
+                } else {
+                    let fc_hz = 8.175_798_915_6 * 2.0f64.powf(eff_fc_cents as f64 / 1_200.0);
+                    let active =
+                        (eff_fc_cents < 13_499.0 && fc_hz < 0.45 * sr) || region.filter_q_cb > 0.5;
+                    if active {
+                        (true, VoiceFilter::from_fc_q(fc_hz, region.filter_q_cb, sr))
+                    } else {
+                        (false, VoiceFilter::default())
+                    }
                 }
             } else {
                 (false, VoiceFilter::default())
@@ -2295,7 +2534,7 @@ impl SoundFontSynth {
                     gain_l,
                     gain_r,
                     env_level: 0.0,
-                    attack_inc: 1.0 / attack_samples,
+                    attack_inc,
                     decay_mul,
                     sustain_level: region.env_sustain,
                     release_mul,
@@ -2342,28 +2581,32 @@ impl SoundFontSynth {
         let damper_down = self.channels[channel].sustain;
         let head_idx = (channel << 7) | ((key as usize) & 0x7F);
         let mut cur = self.key_heads[head_idx];
+        self.key_heads[head_idx] = NO_VOICE_LINK;
         while cur != NO_VOICE_LINK {
             let slot = cur as usize;
             let Some(cv) = self.cold_voices.get_mut(slot) else {
                 break;
             };
             cur = cv.next_on_key;
+            cv.prev_on_key = NO_VOICE_LINK;
+            cv.next_on_key = NO_VOICE_LINK;
+            cv.in_key_list = false;
             if cv.active {
                 cv.key_released = true;
                 if let Some(hv) = self.hot_voices.get_mut(slot) {
                     if hv.loop_mode == RegionLoopMode::OneShot {
                         continue;
                     }
-                        if damper_down {
-                            cv.sustained = true;
-                        } else if cv.sostenuto {
-                            // Held by CC66 Sostenuto pedal until CC66 releases.
-                        } else if !hv.has_rendered {
-                            // Same-block Note-On + Note-Off: defer Release until attack/first block renders.
-                            hv.pending_release = true;
-                        } else if hv.env_stage != EnvStage::Release {
-                            hv.env_stage = EnvStage::Release;
-                        }
+                    if damper_down {
+                        cv.sustained = true;
+                    } else if cv.sostenuto {
+                        // Held by CC66 Sostenuto pedal until CC66 releases.
+                    } else if !hv.has_rendered {
+                        // Same-block Note-On + Note-Off: defer Release until attack/first block renders.
+                        hv.pending_release = true;
+                    } else if hv.env_stage != EnvStage::Release {
+                        hv.env_stage = EnvStage::Release;
+                    }
                 }
             }
         }
@@ -2630,6 +2873,7 @@ impl SynthBackend for SoundFontSynth {
 
     #[inline]
     fn render_audio(&mut self, output: &mut [f32]) {
+        enable_ftz_daz();
         output.fill(0.0);
 
         let total_frames = output.len() / 2;
@@ -3565,14 +3809,64 @@ unsafe fn apply_lpf4_left_avx2(samples: __m128, flt: &mut VoiceFilter) -> __m128
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 #[inline]
-unsafe fn apply_lpf4_right_avx2(samples: __m128, flt: &mut VoiceFilter) -> __m128 {
-    let mut tmp = [0.0f32; 4];
-    _mm_storeu_ps(tmp.as_mut_ptr(), samples);
-    let y0 = flt.step_right(tmp[0]);
-    let y1 = flt.step_right(tmp[1]);
-    let y2 = flt.step_right(tmp[2]);
-    let y3 = flt.step_right(tmp[3]);
-    _mm_set_ps(y3, y2, y1, y0)
+unsafe fn apply_lpf4_stereo_avx2(
+    sl4: __m128,
+    sr4: __m128,
+    flt: &mut VoiceFilter,
+) -> (__m128, __m128) {
+    use core::arch::x86_64::*;
+
+    let b0 = _mm_set1_ps(flt.b0);
+    let a1 = _mm_set1_ps(flt.a1);
+    let a2 = _mm_set1_ps(flt.a2);
+
+    // Interleave [L0, R0, L1, R1] & [L2, R2, L3, R3], pre-scaled by b0 and 2*b0.
+    let p01 = _mm_unpacklo_ps(sl4, sr4);
+    let p23 = _mm_unpackhi_ps(sl4, sr4);
+    let bp01 = _mm_mul_ps(p01, b0);
+    let bp23 = _mm_mul_ps(p23, b0);
+    let b1p01 = _mm_add_ps(bp01, bp01);
+    let b1p23 = _mm_add_ps(bp23, bp23);
+
+    let b0x0 = bp01;
+    let b0x1 = _mm_movehl_ps(bp01, bp01);
+    let b0x2 = bp23;
+    let b0x3 = _mm_movehl_ps(bp23, bp23);
+
+    let b1x0 = b1p01;
+    let b1x1 = _mm_movehl_ps(b1p01, b1p01);
+    let b1x2 = b1p23;
+    let b1x3 = _mm_movehl_ps(b1p23, b1p23);
+
+    let mut z1 = _mm_set_ps(0.0, 0.0, flt.r_z1, flt.l_z1);
+    let mut z2 = _mm_set_ps(0.0, 0.0, flt.r_z2, flt.l_z2);
+
+    let y0 = _mm_add_ps(b0x0, z1);
+    z1 = _mm_fnmadd_ps(a1, y0, _mm_add_ps(b1x0, z2));
+    z2 = _mm_fnmadd_ps(a2, y0, b0x0);
+
+    let y1 = _mm_add_ps(b0x1, z1);
+    z1 = _mm_fnmadd_ps(a1, y1, _mm_add_ps(b1x1, z2));
+    z2 = _mm_fnmadd_ps(a2, y1, b0x1);
+
+    let y2 = _mm_add_ps(b0x2, z1);
+    z1 = _mm_fnmadd_ps(a1, y2, _mm_add_ps(b1x2, z2));
+    z2 = _mm_fnmadd_ps(a2, y2, b0x2);
+
+    let y3 = _mm_add_ps(b0x3, z1);
+    z1 = _mm_fnmadd_ps(a1, y3, _mm_add_ps(b1x3, z2));
+    z2 = _mm_fnmadd_ps(a2, y3, b0x3);
+
+    flt.l_z1 = _mm_cvtss_f32(z1);
+    flt.r_z1 = _mm_cvtss_f32(_mm_shuffle_ps(z1, z1, 1));
+    flt.l_z2 = _mm_cvtss_f32(z2);
+    flt.r_z2 = _mm_cvtss_f32(_mm_shuffle_ps(z2, z2, 1));
+
+    let y01 = _mm_movelh_ps(y0, y1);
+    let y23 = _mm_movelh_ps(y2, y3);
+    let out_l4 = _mm_shuffle_ps(y01, y23, 0x88);
+    let out_r4 = _mm_shuffle_ps(y01, y23, 0xDD);
+    (out_l4, out_r4)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3751,8 +4045,9 @@ unsafe fn render_fast_sinc8_stereo_avx2<const FILTER: bool>(
             _mm256_mul_ps(_mm256_loadu_ps(right_ptr.add(i3).sub(3)), k3),
         );
         if FILTER {
-            sl4 = apply_lpf4_left_avx2(sl4, flt);
-            sr4 = apply_lpf4_right_avx2(sr4, flt);
+            let (fl, fr) = apply_lpf4_stereo_avx2(sl4, sr4, flt);
+            sl4 = fl;
+            sr4 = fr;
         }
 
         let env4 = env4_avx2(&mut env_mode);
@@ -3969,8 +4264,9 @@ unsafe fn render_fast_sinc16_stereo_avx2<const FILTER: bool>(
         );
 
         if FILTER {
-            sl4 = apply_lpf4_left_avx2(sl4, flt);
-            sr4 = apply_lpf4_right_avx2(sr4, flt);
+            let (fl, fr) = apply_lpf4_stereo_avx2(sl4, sr4, flt);
+            sl4 = fl;
+            sr4 = fr;
         }
         let env4 = env4_avx2(&mut env_mode);
         accumulate_stereo4_avx2(
@@ -4174,8 +4470,9 @@ unsafe fn render_fast_sinc32_stereo_avx2<const FILTER: bool>(
         );
 
         if FILTER {
-            sl4 = apply_lpf4_left_avx2(sl4, flt);
-            sr4 = apply_lpf4_right_avx2(sr4, flt);
+            let (fl, fr) = apply_lpf4_stereo_avx2(sl4, sr4, flt);
+            sl4 = fl;
+            sr4 = fr;
         }
         let env4 = env4_avx2(&mut env_mode);
         accumulate_stereo4_avx2(
@@ -5005,20 +5302,22 @@ mod tests {
                 ..SynthConfig::default()
             })
             .expect("init");
-        synth.bank = SoundFontBank {
-            samples: Box::new([sample_asset]),
-            regions: Box::new([
+        synth.bank = SoundFontBank::from_parts(
+            Box::new([sample_asset]),
+            Box::new([
                 make_region(13_500.0, 0.0, 0, 60, 60), // key 60: bypassed filter
                 make_region(6_735.0, 0.0, 0, 61, 61),  // key 61: ~400 Hz active LPF
                 make_region(13_500.0, 0.0, 1, 42, 46), // keys 42..46: hi-hat exclusiveClass = 1
             ]),
-            presets: Box::new([PresetEntry {
+            Box::new([PresetEntry {
                 bank: 0,
                 preset: 0,
                 region_start: 0,
                 region_count: 3,
+                key_bucket_base: 0,
             }]),
-        };
+            synth.config.sample_rate,
+        );
 
         // Key 60 (bypassed filter) -> filter_active MUST be false
         synth.process_short_event(0x007F_3C90);
@@ -5140,9 +5439,9 @@ mod tests {
         let raw: Vec<f32> = (0..8192)
             .map(|i| (2.0 * core::f32::consts::PI * 440.0 * (i as f32) / (sr as f32)).sin() * 0.8)
             .collect();
-        let make_bank = || SoundFontBank {
-            samples: Box::new([SampleAsset::from_raw(&raw, sr)]),
-            regions: Box::new([SynthRegion {
+        let make_bank = || SoundFontBank::from_parts(
+            Box::new([SampleAsset::from_raw(&raw, sr)]),
+            Box::new([SynthRegion {
                 sample_idx: 0,
                 right_sample_idx: NO_SAMPLE,
                 key_low: 0,
@@ -5174,13 +5473,15 @@ mod tests {
                 vib_freq_hz: 8.176,
                 vib_to_pitch_cents: 0.0,
             }]),
-            presets: Box::new([PresetEntry {
+            Box::new([PresetEntry {
                 bank: 0,
                 preset: 0,
                 region_start: 0,
                 region_count: 1,
+                key_bucket_base: 0,
             }]),
-        };
+            sr,
+        );
 
         let mut synth = SoundFontSynth::new();
         synth
@@ -5259,9 +5560,9 @@ mod tests {
         let raw: Vec<f32> = (0..8192)
             .map(|i| (2.0 * core::f32::consts::PI * 440.0 * (i as f32) / (sr as f32)).sin() * 0.6)
             .collect();
-        let make_bank = || SoundFontBank {
-            samples: Box::new([SampleAsset::from_raw(&raw, sr)]),
-            regions: Box::new([SynthRegion {
+        let make_bank = || SoundFontBank::from_parts(
+            Box::new([SampleAsset::from_raw(&raw, sr)]),
+            Box::new([SynthRegion {
                 sample_idx: 0,
                 right_sample_idx: NO_SAMPLE,
                 key_low: 0,
@@ -5293,13 +5594,15 @@ mod tests {
                 vib_freq_hz: 8.176,
                 vib_to_pitch_cents: 0.0,
             }]),
-            presets: Box::new([PresetEntry {
+            Box::new([PresetEntry {
                 bank: 0,
                 preset: 0,
                 region_start: 0,
                 region_count: 1,
+                key_bucket_base: 0,
             }]),
-        };
+            sr,
+        );
 
         let mut synth = SoundFontSynth::new();
         synth
@@ -5467,5 +5770,86 @@ mod tests {
             let s16 = (sample * 28_000.0) as i16;
             f.write_all(&s16.to_le_bytes()).expect("sample");
         }
+    }
+}
+
+#[cfg(test)]
+mod dsp_hotpath_fix_tests {
+    use super::*;
+
+    #[test]
+    fn filter_trig_lut_matches_exact_from_fc_q() {
+        let sr = 48_000u32;
+        let lut = build_filter_trig_lut(sr);
+        for &q_cb in &[0.0f32, 30.0, 96.0] {
+            let q_db = (q_cb / 10.0).clamp(0.0, 96.0) as f64;
+            let q_lin = 10.0f64.powf(q_db / 20.0) * core::f64::consts::FRAC_1_SQRT_2;
+            let inv_2q = (0.5 / q_lin) as f32;
+
+            for step in 0..=240 {
+                let eff_fc_cents = 1_500.0 + (step as f32) * 50.0;
+                let fc_hz = 8.175_798_915_6 * 2.0f64.powf(eff_fc_cents as f64 / 1_200.0);
+                let exact = VoiceFilter::from_fc_q(fc_hz, q_cb, sr as f64);
+
+                let t = (eff_fc_cents - 1_500.0) * (FILTER_TRIG_LUT_STEPS as f32 / 12_000.0);
+                let idx = (t as usize).min(FILTER_TRIG_LUT_STEPS - 1);
+                let frac = t - (idx as f32);
+                let (c0, s0) = lut[idx];
+                let (c1, s1) = lut[idx + 1];
+                let approx =
+                    VoiceFilter::from_cos_sin_inv2q(c0 + (c1 - c0) * frac, s0 + (s1 - s0) * frac, inv_2q);
+
+                assert!((exact.b0 - approx.b0).abs() < 1.0e-3, "b0 mismatch at {eff_fc_cents}c");
+                assert!((exact.a1 - approx.a1).abs() < 1.0e-3, "a1 mismatch at {eff_fc_cents}c");
+                assert!((exact.a2 - approx.a2).abs() < 1.0e-3, "a2 mismatch at {eff_fc_cents}c");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn stereo_biquad_avx2_matches_scalar_and_ftz_daz_active() {
+        enable_ftz_daz();
+        let tiny = core::hint::black_box(f32::from_bits(1));
+        assert_eq!(core::hint::black_box(tiny * 0.5f32), 0.0);
+
+        if !detect_avx2_fma() {
+            return;
+        }
+        let mut flt_scalar = VoiceFilter::from_fc_q(1_800.0, 45.0, 48_000.0);
+        let mut flt_simd = flt_scalar;
+
+        for blk in 0..32usize {
+            let mut l_in = [0.0f32; 4];
+            let mut r_in = [0.0f32; 4];
+            for k in 0..4 {
+                let n = (blk * 4 + k) as f32;
+                l_in[k] = (n * 0.17).sin() * 0.8;
+                r_in[k] = (n * 0.31 + 0.7).cos() * 0.6;
+            }
+            let mut l_ref = [0.0f32; 4];
+            let mut r_ref = [0.0f32; 4];
+            for k in 0..4 {
+                l_ref[k] = flt_scalar.step_left(l_in[k]);
+                r_ref[k] = flt_scalar.step_right(r_in[k]);
+            }
+            let (mut l_got, mut r_got) = ([0.0f32; 4], [0.0f32; 4]);
+            unsafe {
+                use core::arch::x86_64::{_mm_set_ps, _mm_storeu_ps};
+                let sl4 = _mm_set_ps(l_in[3], l_in[2], l_in[1], l_in[0]);
+                let sr4 = _mm_set_ps(r_in[3], r_in[2], r_in[1], r_in[0]);
+                let (ol, or) = apply_lpf4_stereo_avx2(sl4, sr4, &mut flt_simd);
+                _mm_storeu_ps(l_got.as_mut_ptr(), ol);
+                _mm_storeu_ps(r_got.as_mut_ptr(), or);
+            }
+            for k in 0..4 {
+                assert!((l_ref[k] - l_got[k]).abs() < 1.0e-5, "L mismatch blk={blk} k={k}");
+                assert!((r_ref[k] - r_got[k]).abs() < 1.0e-5, "R mismatch blk={blk} k={k}");
+            }
+        }
+        assert!((flt_scalar.l_z1 - flt_simd.l_z1).abs() < 1.0e-5);
+        assert!((flt_scalar.l_z2 - flt_simd.l_z2).abs() < 1.0e-5);
+        assert!((flt_scalar.r_z1 - flt_simd.r_z1).abs() < 1.0e-5);
+        assert!((flt_scalar.r_z2 - flt_simd.r_z2).abs() < 1.0e-5);
     }
 }
