@@ -187,28 +187,7 @@ impl DirectKdmapiEngine {
 
         let hooks = RtEngineHooks::new(Arc::clone(&shared));
         let (driver, negotiated_sr) = match AudioDriver::start(backend, config, hooks) {
-            Ok((driver, negotiated_sr)) => {
-                if negotiated_sr != config.sample_rate && !sf_paths.is_empty() {
-                    config.sample_rate = negotiated_sr;
-                    if let Some(mut reclaimed) = driver.stop() {
-                        let _ = reclaimed.init(config);
-                        let _ = reclaimed.load_soundfonts(&sf_paths);
-                        let retry_hooks = RtEngineHooks::new(Arc::clone(&shared));
-                        match AudioDriver::start(reclaimed, config, retry_hooks) {
-                            Ok((restarted, sr)) => (restarted, sr),
-                            Err(_) => {
-                                shared.running.store(false, Ordering::Release);
-                                return Err(BackendError::InitFailed);
-                            }
-                        }
-                    } else {
-                        shared.running.store(false, Ordering::Release);
-                        return Err(BackendError::InitFailed);
-                    }
-                } else {
-                    (driver, negotiated_sr)
-                }
-            }
+            Ok(res) => res,
             Err(_) => {
                 shared.running.store(false, Ordering::Release);
                 return Err(BackendError::InitFailed);

@@ -179,31 +179,8 @@ impl RuntimeEngine {
 
         match AudioDriver::start(backend, ctrl.config, self.rt_hooks()) {
             Ok((driver, negotiated_sr)) => {
-                // If hardware negotiated a different sample rate and SoundFonts were loaded,
-                // reload SF2 samples at the exact hardware rate before playback continues.
-                if negotiated_sr != ctrl.config.sample_rate && !ctrl.loaded_soundfonts.is_empty() {
-                    ctrl.config.sample_rate = negotiated_sr;
-                    if let Some(mut reclaimed) = driver.stop() {
-                        let _ = reclaimed.init(ctrl.config);
-                        let _ = reclaimed.load_soundfonts(&ctrl.loaded_soundfonts);
-                        match AudioDriver::start(reclaimed, ctrl.config, self.rt_hooks()) {
-                            Ok((restarted, _)) => {
-                                ctrl.driver = Some(restarted);
-                            }
-                            Err(b) => {
-                                ctrl.backend = Some(b);
-                                self.shared.running.store(false, Ordering::Release);
-                                return false;
-                            }
-                        }
-                    } else {
-                        self.shared.running.store(false, Ordering::Release);
-                        return false;
-                    }
-                } else {
-                    ctrl.config.sample_rate = negotiated_sr;
-                    ctrl.driver = Some(driver);
-                }
+                ctrl.config.sample_rate = negotiated_sr;
+                ctrl.driver = Some(driver);
 
                 if telemetry_enabled && ctrl.telemetry_worker.is_none() {
                     let shared = Arc::clone(&self.shared);

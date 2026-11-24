@@ -179,6 +179,7 @@ pub trait SynthBackend: Send + 'static {
         }
         Ok(())
     }
+    fn recompute_for_sample_rate(&mut self, _sample_rate: u32) {}
 
     /// O(1), allocation-free backend statistics snapshot.
     fn stats(&self) -> SynthStats;

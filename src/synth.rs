@@ -361,6 +361,27 @@ fn compute_filter_max_active_cents(sr: u32) -> f32 {
     let sr_f64 = sr.max(8_000) as f64;
     (1_200.0 * ((0.45 * sr_f64) / 8.175_798_915_6).log2()).min(13_499.0) as f32
 }
+fn build_region_precomp(samples: &[SampleAsset], regions: &[SynthRegion], precomp_sr: u32) -> Box<[RegionPrecomp]> {
+    let (sr_f64, sr_f32) = (precomp_sr as f64, precomp_sr as f32);
+    regions.iter().map(|r| {
+        let attack_samples = (timecents_to_secs(r.env_attack_tc).max(0.001) * sr_f32).max(1.0);
+        let base_decay_samples = (timecents_to_secs(r.env_decay_tc).max(0.001) * sr_f32).max(1.0);
+        let release_samples = (timecents_to_secs(r.env_release_tc).max(0.005) * sr_f32).max(16.0);
+        let sample_sr = samples.get(r.sample_idx as usize).map(|a| a.sample_rate.max(1) as f64).unwrap_or(sr_f64);
+        let q_lin = 10.0f64.powf((r.filter_q_cb / 10.0).clamp(0.0, 96.0) as f64 / 20.0) * core::f64::consts::FRAC_1_SQRT_2;
+        RegionPrecomp {
+            delay_samples: (timecents_to_secs(r.env_delay_tc) * sr_f32) as u32,
+            attack_inc: 1.0 / attack_samples,
+            base_hold_samples: (timecents_to_secs(r.env_hold_tc) * sr_f32) as u32,
+            base_decay_mul: (LN_ENV_ATTEN / base_decay_samples).exp().clamp(0.5, 0.999_999),
+            release_mul: (LN_ENV_ATTEN / release_samples).exp().clamp(0.5, 0.999_999),
+            has_key_to_hold: r.key_to_hold_tc != 0.0,
+            has_key_to_decay: r.key_to_decay_tc != 0.0,
+            tune_sr_mul: 2.0f64.powf(r.tune_cents as f64 / 1200.0) * (sample_sr / sr_f64),
+            filter_inv_2q: (0.5 / q_lin) as f32,
+        }
+    }).collect::<Vec<_>>().into_boxed_slice()
+}
 
 /// Immutable, pre-loaded SoundFont bank ready for lock-free, allocation-free rendering.
 pub struct SoundFontBank {
@@ -472,6 +493,15 @@ impl SoundFontBank {
             filter_max_active_cents: compute_filter_max_active_cents(precomp_sr),
             precomp_sr,
         }
+    }
+
+    pub fn recompute_for_sample_rate(&mut self, output_sample_rate: u32) {
+        let precomp_sr = output_sample_rate.max(8_000);
+        if self.precomp_sr == precomp_sr && self.region_precomp.len() == self.regions.len() { return; }
+        self.region_precomp = build_region_precomp(&self.samples, &self.regions, precomp_sr);
+        self.filter_trig_lut = build_filter_trig_lut(precomp_sr);
+        self.filter_max_active_cents = compute_filter_max_active_cents(precomp_sr);
+        self.precomp_sr = precomp_sr;
     }
 
     pub fn preset_count(&self) -> usize {
@@ -3034,13 +3064,21 @@ impl SynthBackend for SoundFontSynth {
     }
 
     fn load_soundfonts(&mut self, paths: &[PathBuf]) -> Result<(), BackendError> {
+        if paths.is_empty() { self.reset(); self.bank = SoundFontBank::empty(); return Ok(()); }
+        if !paths.iter().any(|path| path.exists()) { return Err(BackendError::InvalidPath); }
         let new_bank = SoundFontBank::load_ordered(paths, self.config.sample_rate);
-        if new_bank.preset_count() == 0 && !self.bank.presets.is_empty() {
-            return Err(BackendError::InvalidPath);
-        }
+        if new_bank.preset_count() == 0 && !self.bank.presets.is_empty() { return Err(BackendError::InvalidPath); }
         self.reset();
         self.bank = new_bank;
         Ok(())
+    }
+
+    fn recompute_for_sample_rate(&mut self, sample_rate: u32) {
+        let sr = sample_rate.clamp(8_000, 384_000);
+        self.config.sample_rate = sr;
+        self.choke_release_mul = exp_decay_mul_for_secs(CHOKE_RELEASE_SECS, sr);
+        self.kill_release_mul = exp_decay_mul_for_secs(KILL_RELEASE_SECS, sr);
+        self.bank.recompute_for_sample_rate(sr);
     }
 
     #[inline]
@@ -5851,5 +5889,36 @@ mod dsp_hotpath_fix_tests {
         assert!((flt_scalar.l_z2 - flt_simd.l_z2).abs() < 1.0e-5);
         assert!((flt_scalar.r_z1 - flt_simd.r_z1).abs() < 1.0e-5);
         assert!((flt_scalar.r_z2 - flt_simd.r_z2).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn full_sample_rate_matrix_8khz_to_384khz_recomputes_cleanly() {
+        let rates = [8_000u32, 16_000, 22_050, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 384_000];
+        let raw: Vec<f32> = (0..4800).map(|i| (2.0 * core::f32::consts::PI * 440.0 * (i as f32) / 48_000.0).sin() * 0.7).collect();
+        for &target_sr in &rates {
+            let mut synth = SoundFontSynth::new();
+            synth.init(SynthConfig { sample_rate: 48_000, max_voices: 16, buffer_frames: 256, interpolation: InterpolationMode::Sinc16, ..SynthConfig::default() }).unwrap();
+            synth.bank = SoundFontBank::from_parts(
+                Box::new([SampleAsset::from_raw(&raw, 48_000)]),
+                Box::new([SynthRegion {
+                    sample_idx: 0, right_sample_idx: NO_SAMPLE, key_low: 0, key_high: 127, vel_low: 0, vel_high: 127,
+                    root_key: 69, exclusive_class: 0, loop_mode: RegionLoopMode::LoopContinuous, loop_start: 64, loop_end: 4000,
+                    offset: 0, gain: 1.0, pan: 0.0, tune_cents: 0.0, scale_tuning: 100.0,
+                    env_delay_tc: -12_000.0, env_attack_tc: secs_to_timecents(0.002), env_hold_tc: -12_000.0,
+                    env_decay_tc: secs_to_timecents(0.5), env_release_tc: secs_to_timecents(0.02),
+                    key_to_hold_tc: 0.0, key_to_decay_tc: 0.0, env_sustain: 0.8,
+                    filter_fc_cents: 9_000.0, filter_q_cb: 30.0, vel_to_filter_cents: -1_200.0,
+                    vib_delay_secs: 0.0, vib_freq_hz: 6.0, vib_to_pitch_cents: 15.0,
+                }]),
+                Box::new([PresetEntry { bank: 0, preset: 0, region_start: 0, region_count: 1, key_bucket_base: 0 }]),
+                48_000,
+            );
+            synth.recompute_for_sample_rate(target_sr);
+            assert_eq!(synth.bank.precomp_sr, target_sr);
+            synth.process_short_event(0x007F_4590);
+            let mut out = [0.0f32; 512];
+            synth.render_audio(&mut out);
+            assert!(out.iter().all(|v| v.is_finite() && (-1.0..=1.0).contains(v)), "failed at {} Hz", target_sr);
+        }
     }
 }

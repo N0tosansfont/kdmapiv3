@@ -315,9 +315,10 @@ fn try_start_cpal_stream(
     synth_cfg.sample_rate = device_sr;
 
     // Initialize the backend with the exact hardware sample rate before opening the stream.
-    if backend_slot.as_mut()?.init(*synth_cfg).is_err() {
-        return None;
-    }
+    if let Some(b) = backend_slot.as_mut() {
+        if b.init(*synth_cfg).is_err() { return None; }
+        b.recompute_for_sample_rate(device_sr);
+    } else { return None; }
 
     // Move backend out without allocating any dummy placeholder; restored on failure below.
     let live_backend = backend_slot.take()?;
@@ -484,7 +485,7 @@ fn render_audio_callback<T: cpal::FromSample<f32> + Sample>(
 
     crate::synth::enable_ftz_daz();
     let budget_secs = (total_frames.max(1) as f32) / (sample_rate.max(8_000) as f32);
-    let max_drain_dur = Duration::from_secs_f32((budget_secs * MAX_DRAIN_BUDGET_FRACTION).max(0.0005));
+    let max_drain_dur = Duration::from_secs_f32(budget_secs * MAX_DRAIN_BUDGET_FRACTION);
 
     // 1. Drain MIDI events up to the current real-time playhead without allocating.
     drain_midi_events(backend, batch, hooks, Some((t0, max_drain_dur)));
